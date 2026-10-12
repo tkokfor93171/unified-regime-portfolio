@@ -55,14 +55,8 @@ def expected_weights(market, params: CoreOverlayParams) -> dict:
 
 
 @pytest.fixture
-def run_optimize(tmp_path, monkeypatch, market):
+def run_optimize(backtest_cli, monkeypatch):
     """random_search を差し替え、検証期間アルファを指定して backtest --optimize を走らせる。"""
-    monkeypatch.setattr(main, "ROOT", tmp_path)
-    monkeypatch.setattr(main, "OUTPUT_DIR", tmp_path / "outputs")
-    monkeypatch.setattr(main, "DEFAULT_WEIGHTS_FILE", tmp_path / "outputs" / "target_weights.json")
-    monkeypatch.setattr(main, "load_market_data", lambda start_date=None, end_date=None: market)
-    monkeypatch.setattr(main, "plot_performance", lambda *args, **kwargs: None)
-    monkeypatch.setattr(main, "plot_regime_performance", lambda *args, **kwargs: None)
 
     def run(holdout_alpha: float, *extra: str) -> dict:
         def fake_search(prices, dollar_vol, **kwargs):
@@ -71,7 +65,7 @@ def run_optimize(tmp_path, monkeypatch, market):
 
         monkeypatch.setattr(main, "random_search_core_overlay", fake_search)
         main.main(["backtest", "--strategy", "core_overlay", "--optimize", *extra])
-        return json.loads((tmp_path / "outputs" / "target_weights.json").read_text(encoding="utf-8"))
+        return json.loads((backtest_cli / "target_weights.json").read_text(encoding="utf-8"))
 
     return run
 
@@ -85,12 +79,12 @@ def test_non_positive_holdout_alpha_exports_default_params(run_optimize, market,
     assert "[REJECTED]" in out and "過学習" in out
 
 
-def test_positive_holdout_alpha_adopts_optimized_params(run_optimize, market, capsys, tmp_path):
+def test_positive_holdout_alpha_adopts_optimized_params(run_optimize, backtest_cli, market, capsys):
     payload = run_optimize(0.5)
     assert payload["params"] == asdict(CANDIDATE)
     assert payload["weights"] == expected_weights(market, CANDIDATE)
     assert "[ADOPTED]" in capsys.readouterr().out
-    metrics = pd.read_csv(tmp_path / "outputs" / "core_overlay_metrics.csv", index_col=0)
+    metrics = pd.read_csv(backtest_cli / "core_overlay_metrics.csv", index_col=0)
     assert "TEST_Optimized" in metrics.index
 
 
@@ -101,7 +95,7 @@ def test_force_optimized_overrides_rejection(run_optimize, market, capsys):
     assert "[FORCED]" in capsys.readouterr().out
 
 
-def test_force_optimized_requires_optimize():
+def test_force_optimized_requires_optimize(backtest_cli):
     with pytest.raises(SystemExit) as exc:
         main.main(["backtest", "--strategy", "core_overlay", "--force-optimized"])
     assert exc.value.code == 2

@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import main
 from src.data.loader import DEFAULT_UNIVERSE
 
 BETAS = {"SPY": 1.0, "QQQ": 1.2, "IWM": 1.1, "TLT": -0.3, "GLD": 0.1, "BIL": 0.0}
@@ -44,3 +45,16 @@ def make_synthetic_market(
 @pytest.fixture(scope="session")
 def market() -> tuple[pd.DataFrame, pd.DataFrame]:
     return make_synthetic_market()
+
+
+@pytest.fixture
+def backtest_cli(tmp_path, monkeypatch, market):
+    """main.py backtest を合成データと一時ディレクトリで動かす。実データの取得・作図・既存の outputs/ には触れない。"""
+    out = tmp_path / "outputs"
+    monkeypatch.setattr(main, "ROOT", tmp_path)
+    monkeypatch.setattr(main, "OUTPUT_DIR", out)
+    monkeypatch.setattr(main, "DEFAULT_WEIGHTS_FILE", out / "target_weights.json")
+    monkeypatch.setattr(main, "load_market_data", lambda start_date=None, end_date=None: market)
+    monkeypatch.setattr(main, "plot_performance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "plot_regime_performance", lambda *args, **kwargs: None)
+    return out

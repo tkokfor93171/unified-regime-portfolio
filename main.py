@@ -12,7 +12,7 @@ import pandas as pd
 from src.allocators.base import BaseAllocator
 from src.allocators.core_overlay import CoreOverlayAllocator, CoreOverlayParams
 from src.allocators.defensive_multi import DefensiveMultiAllocator
-from src.allocators.ensemble import EnsembleAllocator
+from src.allocators.ensemble import ENSEMBLE_MODES, EnsembleAllocator
 from src.backtest.engine import compute_metrics, evaluate_by_crowding_regime, run_backtest
 from src.backtest.optimize import random_search_core_overlay
 from src.backtest.plot import plot_performance, plot_regime_performance
@@ -25,8 +25,10 @@ DEFAULT_WEIGHTS_FILE = OUTPUT_DIR / "target_weights.json"
 
 
 def run_label(args: argparse.Namespace) -> str:
-    """出力ファイル名と表示に使う名前。ensemble は比率違いの結果を並べて残せるよう比率を含める。"""
+    """出力ファイル名と表示に使う名前。ensemble は設定違いの結果を並べて残せるよう比率か窓幅を含める。"""
     if args.strategy == "ensemble":
+        if args.ensemble_mode == "inv_vol":
+            return f"ensemble_invvol{args.vol_window}"
         return f"ensemble_core{round(args.core_ratio * 100)}"
     return args.strategy
 
@@ -89,12 +91,16 @@ def cmd_backtest(args: argparse.Namespace) -> None:
                 )
         allocator: BaseAllocator = CoreOverlayAllocator(params)
     elif args.strategy == "ensemble":
-        allocator = EnsembleAllocator(core_ratio=args.core_ratio)
+        if args.ensemble_mode == "inv_vol":
+            allocator = EnsembleAllocator(mode="inv_vol", vol_window=args.vol_window)
+        else:
+            allocator = EnsembleAllocator(core_ratio=args.core_ratio)
     else:
         allocator = DefensiveMultiAllocator()
     label = run_label(args)
 
     weights, crowd_series = allocator.generate_daily_weights(prices, dollar_vol)
+    alpha_t = allocator.alpha_series_ if isinstance(allocator, EnsembleAllocator) else None
     bt = run_backtest(prices, weights, cost_bps=args.cost_bps)
 
     overall = compute_metrics(bt["port_ret"], bt["spy_ret"], bt["turnover"])
@@ -106,6 +112,11 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     header = f"{label}, {params_note}" if params_note else label
     print(f"\n=== Strategy Backtest Summary: [{header}] (Cost: {args.cost_bps} bps) ===")
     print(summary.to_string())
+    if alpha_t is not None and args.ensemble_mode == "inv_vol":
+        print(
+            f"α_t (core_overlay への配分比率): 平均 {alpha_t.mean():.3f} / 最小 {alpha_t.min():.3f} / "
+            f"最大 {alpha_t.max():.3f} / 最新 {alpha_t.iloc[-1]:.3f}"
+        )
     print("\n=== Conditional Performance by Crowding Regime ===")
     print(regime_df.to_string())
     tables.append(regime_df)
@@ -117,6 +128,8 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         spy_equity=(1.0 + bt["spy_ret"]).cumprod(),
         regime_indicator=crowd_series,
     )
+    if alpha_t is not None:
+        daily["core_ratio"] = alpha_t
     daily.to_csv(OUTPUT_DIR / f"{label}_daily.csv")
     weights.to_csv(OUTPUT_DIR / f"{label}_weights.csv")
     pd.concat(tables).to_csv(OUTPUT_DIR / f"{label}_metrics.csv")
@@ -162,6 +175,16 @@ def cmd_audit(args: argparse.Namespace) -> None:
         sys.exit(f"[STOPPED] {e}")
 
 
+def parse_core_ratio(value: str) -> float | str:
+    """--core-ratio の値。auto / inv_vol は逆ボラ比率モードの指定として受け付ける。"""
+    if value.strip().lower() in ("auto", "inv_vol"):
+        return "inv_vol"
+    try:
+        return float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"0.0〜1.0 の数値か auto / inv_vol を指定してください: {value!r}") from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Unified Regime & Market-Structure Portfolio CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -173,9 +196,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--core-ratio",
         "--blend-ratio",
         dest="core_ratio",
-        type=float,
+        type=parse_core_ratio,
         default=None,
-        help="ensemble only: capital share of core_overlay in [0, 1], the rest goes to defensive_multi (Default: 0.5)",
+        help="ensemble only: capital share of core_overlay in [0, 1], the rest goes to defensive_multi (Default: 0.5). "
+        "'auto' or 'inv_vol' selects --ensemble-mode inv_vol",
+    )
+    p_bt.add_argument(
+        "--ensemble-mode",
+        choices=ENSEMBLE_MODES,
+        default=None,
+        help="ensemble only: fixed = constant --core-ratio, inv_vol = inverse-volatility ratio of the two strategies "
+        "updated every 5 days (Default: fixed)",
+    )
+    p_bt.add_argument(
+        "--vol-window",
+        type=int,
+        default=None,
+        help="ensemble inv_vol only: lookback days for each strategy's volatility (Default: 63)",
     )
     p_bt.add_argument("--start", default="2010-01-01")
     p_bt.add_argument("--end", default=None, help="End date (exclusive). Default: latest available")
@@ -215,6 +252,38 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_ensemble_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """ensemble の比率指定を ensemble_mode / core_ratio / vol_window の組み合わせに正規化する。"""
+    if args.strategy != "ensemble":
+        for flag, value in (
+            ("--core-ratio", args.core_ratio),
+            ("--ensemble-mode", args.ensemble_mode),
+            ("--vol-window", args.vol_window),
+        ):
+            if value is not None:
+                parser.error(f"{flag} は --strategy ensemble のときだけ使えます")
+        return
+
+    if args.core_ratio == "inv_vol":
+        if args.ensemble_mode == "fixed":
+            parser.error("--core-ratio auto と --ensemble-mode fixed は同時に指定できません")
+        args.ensemble_mode, args.core_ratio = "inv_vol", None
+    args.ensemble_mode = args.ensemble_mode or "fixed"
+
+    if args.ensemble_mode == "fixed":
+        if args.vol_window is not None:
+            parser.error("--vol-window は --ensemble-mode inv_vol のときだけ使えます")
+        args.core_ratio = 0.5 if args.core_ratio is None else args.core_ratio
+        if not 0.0 <= args.core_ratio <= 1.0:
+            parser.error("--core-ratio は 0.0〜1.0 で指定してください")
+    else:
+        if args.core_ratio is not None:
+            parser.error("--ensemble-mode inv_vol は比率を自動で決めるため --core-ratio とは併用できません")
+        args.vol_window = 63 if args.vol_window is None else args.vol_window
+        if args.vol_window < 10:
+            parser.error("--vol-window は10以上で指定してください")
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -223,13 +292,7 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--optimize は --strategy core_overlay のときだけ使えます")
         if args.force_optimized and not args.optimize:
             parser.error("--force-optimized は --optimize と一緒に指定してください")
-        if args.core_ratio is not None and args.strategy != "ensemble":
-            parser.error("--core-ratio は --strategy ensemble のときだけ使えます")
-        if args.strategy == "ensemble":
-            if args.core_ratio is None:
-                args.core_ratio = 0.5
-            if not 0.0 <= args.core_ratio <= 1.0:
-                parser.error("--core-ratio は 0.0〜1.0 で指定してください")
+        resolve_ensemble_args(parser, args)
         if not 0.0 < args.test_frac < 1.0:
             parser.error("--test-frac は 0 と 1 の間で指定してください")
     args.func(args)

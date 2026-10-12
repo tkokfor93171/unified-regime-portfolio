@@ -14,6 +14,7 @@ ALLOCATORS = {
     "core_overlay": CoreOverlayAllocator,
     "defensive_multi": DefensiveMultiAllocator,
     "ensemble": lambda: EnsembleAllocator(core_ratio=0.5),
+    "ensemble_inv_vol": lambda: EnsembleAllocator(mode="inv_vol"),
 }
 # ウォームアップ中・月中・月末・閏日・年末に加え、月次ウェイトの1日前倒しを捉えるため月末の前営業日も入れる
 CUTS = [
@@ -25,6 +26,13 @@ CUTS = [
 def full_runs(market):
     prices, dollar_vol = market
     return {name: make().generate_daily_weights(prices, dollar_vol) for name, make in ALLOCATORS.items()}
+
+
+@pytest.fixture(scope="module")
+def full_inv_vol_alpha(market):
+    allocator = EnsembleAllocator(mode="inv_vol")
+    allocator.generate_daily_weights(*market)
+    return allocator.alpha_series_
 
 
 @pytest.mark.parametrize("cut", CUTS)
@@ -39,7 +47,16 @@ def test_truncated_history_gives_identical_weights(market, full_runs, name, cut)
     pd.testing.assert_series_equal(regime_part, regime_full.loc[:cut], check_exact=True)
 
 
-def test_synthetic_market_exercises_every_branch(full_runs):
+@pytest.mark.parametrize("cut", CUTS)
+def test_inv_vol_ratio_does_not_use_future_data(market, full_inv_vol_alpha, cut):
+    prices, dollar_vol = market
+    allocator = EnsembleAllocator(mode="inv_vol")
+    allocator.generate_daily_weights(prices.loc[:cut], dollar_vol.loc[:cut])
+    pd.testing.assert_series_equal(allocator.alpha_series_, full_inv_vol_alpha.loc[:cut], check_exact=True)
+    assert allocator.latest_alpha_ == full_inv_vol_alpha.loc[cut]
+
+
+def test_synthetic_market_exercises_every_branch(full_runs, full_inv_vol_alpha):
     """合成データが各分岐を通っていないと、上の一致テストが空振りになるため確認しておく。"""
     w_core, _ = full_runs["core_overlay"]
     bull_on = w_core[["QQQ", "IWM"]].sum(axis=1) > 0
@@ -52,6 +69,10 @@ def test_synthetic_market_exercises_every_branch(full_runs):
     risk_on = w_def.drop(columns="BIL").sum(axis=1) > 0
     assert (w_def.loc[risk_on.idxmax():, "BIL"] == 1.0).any()
     assert w_def.loc[risk_on, "BIL"].nunique() > 1
+
+    alpha = full_inv_vol_alpha
+    assert alpha.nunique() > 100
+    assert alpha.min() < 0.2 and alpha.iloc[0] == 0.5
 
 
 def test_engine_trades_on_the_day_after_the_signal(market):
