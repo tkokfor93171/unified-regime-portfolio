@@ -12,6 +12,7 @@ import pandas as pd
 from src.allocators.base import BaseAllocator
 from src.allocators.core_overlay import CoreOverlayAllocator, CoreOverlayParams
 from src.allocators.defensive_multi import DefensiveMultiAllocator
+from src.allocators.ensemble import EnsembleAllocator
 from src.backtest.engine import compute_metrics, evaluate_by_crowding_regime, run_backtest
 from src.backtest.optimize import random_search_core_overlay
 from src.backtest.plot import plot_performance, plot_regime_performance
@@ -30,6 +31,13 @@ def split_metrics(bt: pd.DataFrame, split_date: pd.Timestamp) -> pd.DataFrame:
         rows[f"{label}_Strategy"] = compute_metrics(part["port_ret"], part["spy_ret"], part["turnover"])
         rows[f"{label}_SPY"] = compute_metrics(part["spy_ret"], part["spy_ret"])
     return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def run_label(args: argparse.Namespace) -> str:
+    """出力ファイル名と表示に使う名前。ensemble は比率違いの結果を並べて残せるよう比率を含める。"""
+    if args.strategy == "ensemble":
+        return f"ensemble_core{round(args.core_ratio * 100)}"
+    return args.strategy
 
 
 def export_target_weights(strategy: str, weights: pd.DataFrame, params: dict, path: Path) -> dict:
@@ -68,8 +76,11 @@ def cmd_backtest(args: argparse.Namespace) -> None:
             for k, v in asdict(params).items():
                 print(f"  {k}: {v}")
         allocator: BaseAllocator = CoreOverlayAllocator(params)
+    elif args.strategy == "ensemble":
+        allocator = EnsembleAllocator(core_ratio=args.core_ratio)
     else:
         allocator = DefensiveMultiAllocator()
+    label = run_label(args)
 
     weights, crowd_series = allocator.generate_daily_weights(prices, dollar_vol)
     bt = run_backtest(prices, weights, cost_bps=args.cost_bps)
@@ -80,7 +91,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     regime_df = evaluate_by_crowding_regime(bt, crowd_series)
     tables = [summary]
 
-    print(f"\n=== Strategy Backtest Summary: [{args.strategy}] (Cost: {args.cost_bps} bps) ===")
+    print(f"\n=== Strategy Backtest Summary: [{label}] (Cost: {args.cost_bps} bps) ===")
     print(summary.to_string())
     if split_date is not None:
         split_df = split_metrics(bt, split_date)
@@ -98,13 +109,13 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         spy_equity=(1.0 + bt["spy_ret"]).cumprod(),
         regime_indicator=crowd_series,
     )
-    daily.to_csv(OUTPUT_DIR / f"{args.strategy}_daily.csv")
-    weights.to_csv(OUTPUT_DIR / f"{args.strategy}_weights.csv")
-    pd.concat(tables).to_csv(OUTPUT_DIR / f"{args.strategy}_metrics.csv")
-    title = f"{args.strategy} ({prices.index[0].date()} - {prices.index[-1].date()}, {args.cost_bps:g} bps)"
-    plot_performance(bt, title, OUTPUT_DIR / f"{args.strategy}_performance.png")
-    plot_regime_performance(regime_df, title, OUTPUT_DIR / f"{args.strategy}_regime.png")
-    print(f"\n[Saved] outputs/{args.strategy}_{{daily,weights,metrics}}.csv, outputs/{args.strategy}_{{performance,regime}}.png")
+    daily.to_csv(OUTPUT_DIR / f"{label}_daily.csv")
+    weights.to_csv(OUTPUT_DIR / f"{label}_weights.csv")
+    pd.concat(tables).to_csv(OUTPUT_DIR / f"{label}_metrics.csv")
+    title = f"{label} ({prices.index[0].date()} - {prices.index[-1].date()}, {args.cost_bps:g} bps)"
+    plot_performance(bt, title, OUTPUT_DIR / f"{label}_performance.png")
+    plot_regime_performance(regime_df, title, OUTPUT_DIR / f"{label}_regime.png")
+    print(f"\n[Saved] outputs/{label}_{{daily,weights,metrics}}.csv, outputs/{label}_{{performance,regime}}.png")
 
     # 最新日のターゲットウェイトを執行エンジン向けにJSON出力
     payload = export_target_weights(args.strategy, weights, allocator.params_dict(), DEFAULT_WEIGHTS_FILE)
@@ -148,7 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 1. Backtest & Export Weights
     p_bt = sub.add_parser("backtest", help="Run backtest and export latest target_weights.json")
-    p_bt.add_argument("--strategy", choices=["core_overlay", "defensive_multi"], default="core_overlay")
+    p_bt.add_argument("--strategy", choices=["core_overlay", "defensive_multi", "ensemble"], default="core_overlay")
+    p_bt.add_argument(
+        "--core-ratio",
+        "--blend-ratio",
+        dest="core_ratio",
+        type=float,
+        default=None,
+        help="ensemble only: capital share of core_overlay in [0, 1], the rest goes to defensive_multi (Default: 0.5)",
+    )
     p_bt.add_argument("--start", default="2010-01-01")
     p_bt.add_argument("--end", default=None, help="End date (exclusive). Default: latest available")
     p_bt.add_argument("--cost-bps", type=float, default=10.0)
@@ -183,6 +202,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "backtest":
         if args.optimize and args.strategy != "core_overlay":
             parser.error("--optimize は --strategy core_overlay のときだけ使えます")
+        if args.core_ratio is not None and args.strategy != "ensemble":
+            parser.error("--core-ratio は --strategy ensemble のときだけ使えます")
+        if args.strategy == "ensemble":
+            if args.core_ratio is None:
+                args.core_ratio = 0.5
+            if not 0.0 <= args.core_ratio <= 1.0:
+                parser.error("--core-ratio は 0.0〜1.0 で指定してください")
         if not 0.0 < args.test_frac < 1.0:
             parser.error("--test-frac は 0 と 1 の間で指定してください")
     args.func(args)
