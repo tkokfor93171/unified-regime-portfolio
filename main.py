@@ -24,15 +24,6 @@ LOG_DIR = ROOT / "logs"
 DEFAULT_WEIGHTS_FILE = OUTPUT_DIR / "target_weights.json"
 
 
-def split_metrics(bt: pd.DataFrame, split_date: pd.Timestamp) -> pd.DataFrame:
-    rows = {}
-    for label, mask in (("TRAIN", bt.index < split_date), ("TEST", bt.index >= split_date)):
-        part = bt.loc[mask]
-        rows[f"{label}_Strategy"] = compute_metrics(part["port_ret"], part["spy_ret"], part["turnover"])
-        rows[f"{label}_SPY"] = compute_metrics(part["spy_ret"], part["spy_ret"])
-    return pd.DataFrame.from_dict(rows, orient="index")
-
-
 def run_label(args: argparse.Namespace) -> str:
     """出力ファイル名と表示に使う名前。ensemble は比率違いの結果を並べて残せるよう比率を含める。"""
     if args.strategy == "ensemble":
@@ -58,7 +49,8 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     prices, dollar_vol = load_market_data(start_date=args.start, end_date=args.end)
     print(f"Loaded {list(prices.columns)}: {prices.index[0].date()} -> {prices.index[-1].date()} ({len(prices)} days)")
 
-    split_date = None
+    holdout = None
+    params_note = ""
     if args.strategy == "core_overlay":
         params = CoreOverlayParams()
         if args.optimize:
@@ -71,10 +63,30 @@ def cmd_backtest(args: argparse.Namespace) -> None:
                 test_frac=args.test_frac,
                 seed=args.seed,
             )
-            params, split_date = result.params, result.split_date
+            holdout = result.holdout
             print("\n=== Best Params (selected on TRAIN only) ===")
-            for k, v in asdict(params).items():
+            for k, v in asdict(result.params).items():
                 print(f"  {k}: {v}")
+            print(f"\n=== Holdout Check (TEST: {result.split_date.date()} ->) ===")
+            print(holdout.to_string())
+
+            alpha = result.holdout_alpha
+            if result.accepted:
+                params, params_note = result.params, "optimized params"
+                print(f"[ADOPTED] 検証期間のアルファが {alpha:+.2f}% で正のため、最適化パラメータを採用します。")
+            elif args.force_optimized:
+                params, params_note = result.params, "optimized params (forced)"
+                print(
+                    f"[FORCED] 検証期間のアルファは {alpha:+.2f}% で正ではありませんが、"
+                    "--force-optimized により最適化パラメータを採用します。"
+                )
+            else:
+                params_note = "default params"
+                print(
+                    f"[REJECTED] 検証期間のアルファが {alpha:+.2f}% で正ではないため、"
+                    "過学習と判定して最適化パラメータを棄却しました。\n"
+                    "           target_weights.json には既定パラメータのウェイトを書き出します（強制採用は --force-optimized）。"
+                )
         allocator: BaseAllocator = CoreOverlayAllocator(params)
     elif args.strategy == "ensemble":
         allocator = EnsembleAllocator(core_ratio=args.core_ratio)
@@ -89,15 +101,11 @@ def cmd_backtest(args: argparse.Namespace) -> None:
     spy_bench = compute_metrics(bt["spy_ret"], bt["spy_ret"])
     summary = pd.DataFrame.from_dict({"Strategy": overall, "SPY_BuyHold": spy_bench}, orient="index")
     regime_df = evaluate_by_crowding_regime(bt, crowd_series)
-    tables = [summary]
+    tables = [summary] if holdout is None else [summary, holdout]
 
-    print(f"\n=== Strategy Backtest Summary: [{label}] (Cost: {args.cost_bps} bps) ===")
+    header = f"{label}, {params_note}" if params_note else label
+    print(f"\n=== Strategy Backtest Summary: [{header}] (Cost: {args.cost_bps} bps) ===")
     print(summary.to_string())
-    if split_date is not None:
-        split_df = split_metrics(bt, split_date)
-        tables.append(split_df)
-        print(f"\n=== Selection (TRAIN) vs Holdout (TEST: {split_date.date()} ->) ===")
-        print(split_df.to_string())
     print("\n=== Conditional Performance by Crowding Regime ===")
     print(regime_df.to_string())
     tables.append(regime_df)
@@ -139,6 +147,7 @@ def cmd_execute(args: argparse.Namespace) -> None:
             max_orders=args.max_orders,
             min_notional=args.min_notional,
             allow_multi_run_today=args.allow_multi_run_today,
+            require_market_open=args.require_market_open,
         )
     except ExecutionError as e:
         sys.exit(f"\n[STOPPED] {e}")
@@ -172,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--end", default=None, help="End date (exclusive). Default: latest available")
     p_bt.add_argument("--cost-bps", type=float, default=10.0)
     p_bt.add_argument("--optimize", action="store_true", help="core_overlay only: capped random search on TRAIN, report TEST")
+    p_bt.add_argument(
+        "--force-optimized",
+        action="store_true",
+        help="With --optimize: adopt the optimized params even if the holdout (TEST) alpha is not positive",
+    )
     p_bt.add_argument("--n-candidates", type=int, default=200, help="Random search: max candidates")
     p_bt.add_argument("--patience", type=int, default=60, help="Random search: early stop after N non-improving candidates")
     p_bt.add_argument("--test-frac", type=float, default=0.20, help="Random search: holdout fraction at the end")
@@ -187,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ex.add_argument("--max-orders", type=int, default=5)
     p_ex.add_argument("--min-notional", type=float, default=20.0, help="Skip orders smaller than this (USD)")
     p_ex.add_argument("--allow-multi-run-today", action="store_true")
+    p_ex.add_argument(
+        "--require-market-open",
+        action="store_true",
+        help="Block --submit while the market is closed (Default: warn and queue orders for the next open)",
+    )
     p_ex.set_defaults(func=cmd_execute)
 
     # 3. Account & Order Audit
@@ -202,6 +221,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "backtest":
         if args.optimize and args.strategy != "core_overlay":
             parser.error("--optimize は --strategy core_overlay のときだけ使えます")
+        if args.force_optimized and not args.optimize:
+            parser.error("--force-optimized は --optimize と一緒に指定してください")
         if args.core_ratio is not None and args.strategy != "ensemble":
             parser.error("--core-ratio は --strategy ensemble のときだけ使えます")
         if args.strategy == "ensemble":

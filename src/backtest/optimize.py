@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.allocators.core_overlay import CoreOverlayAllocator, CoreOverlayParams
-from src.backtest.engine import run_backtest
+from src.backtest.engine import compute_metrics, run_backtest
 from src.signals.features import compute_daily_crowding_score
 
 # 過剰適合を抑えるため意図的に狭い範囲だけを探索する
@@ -34,6 +34,29 @@ class SearchResult:
     score: float
     n_evaluated: int
     split_date: pd.Timestamp
+    holdout: pd.DataFrame  # 選ばれたパラメータの TRAIN / TEST 成績 (split_metrics の出力)
+
+    @property
+    def holdout_alpha(self) -> float:
+        """検証期間(TEST)における年率アルファ(%)。計算できない場合は NaN。"""
+        try:
+            return float(self.holdout.loc["TEST_Optimized", "Alpha(%)"])
+        except KeyError:
+            return float("nan")
+
+    @property
+    def accepted(self) -> bool:
+        """検証期間のアルファが正のときだけ採用する（NaN は不採用）。"""
+        return self.holdout_alpha > 0
+
+
+def split_metrics(bt: pd.DataFrame, split_date: pd.Timestamp) -> pd.DataFrame:
+    rows = {}
+    for label, mask in (("TRAIN", bt.index < split_date), ("TEST", bt.index >= split_date)):
+        part = bt.loc[mask]
+        rows[f"{label}_Optimized"] = compute_metrics(part["port_ret"], part["spy_ret"], part["turnover"])
+        rows[f"{label}_SPY"] = compute_metrics(part["spy_ret"], part["spy_ret"])
+    return pd.DataFrame.from_dict(rows, orient="index")
 
 
 def selection_score(port_ret: pd.Series, spy_ret: pd.Series, turnover: pd.Series) -> float:
@@ -66,7 +89,7 @@ def selection_score(port_ret: pd.Series, spy_ret: pd.Series, turnover: pd.Series
         + 0.10 * ir
         - 0.25 * abs(beta - 1.0)
         - 0.15 * abs(mdd)
-        - 0.20 * float(turnover.mean())
+        - 0.20 * float(turnover.mean() * 252)
     )
 
 
@@ -128,4 +151,7 @@ def random_search_core_overlay(
     if best is None:
         raise RuntimeError("ランダムサーチで評価できた候補がありません。")
     print(f"[DONE] {len(seen)} 候補を評価 ({time.time() - t0:.1f}s)  best_score={best_score:.4f}")
-    return SearchResult(params=best, score=best_score, n_evaluated=len(seen), split_date=split_date)
+
+    best_weights = CoreOverlayAllocator(best).weights_from_crowding(prices, crowd_score, thresholds[best.crowd_q])
+    holdout = split_metrics(run_backtest(prices, best_weights, cost_bps=cost_bps), split_date)
+    return SearchResult(params=best, score=best_score, n_evaluated=len(seen), split_date=split_date, holdout=holdout)

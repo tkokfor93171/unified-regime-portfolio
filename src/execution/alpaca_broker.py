@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 
 ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 STALE_WEIGHTS_DAYS = 7
+# 3連休明けでも直近の約定は4日以内に収まるため、5日以上前なら配信の異常とみなす
+STALE_PRICE_DAYS = 5
 
 
 class ExecutionError(RuntimeError):
@@ -113,6 +115,7 @@ class AlpacaExecutionEngine:
         max_orders: int = 5,
         min_notional: float = 20.0,
         allow_multi_run_today: bool = False,
+        require_market_open: bool = False,
     ) -> list[dict]:
         """
         target_weights.json を読み込み、6つの安全ガードを適用してリバランスを実行する。
@@ -123,6 +126,10 @@ class AlpacaExecutionEngine:
         ガード4: 1回あたりの注文数の上限 (max_orders)
         ガード5: 最小発注金額未満の差分は発注しない (min_notional)
         ガード6: 冪等ロック。UTC日付で1日1回に制限し、未約定の注文が残っていれば送信しない
+
+        追加チェック:
+          - 最新約定が STALE_PRICE_DAYS 日以上前の銘柄があれば、ドライランでも停止する
+          - require_market_open=True なら閉場中の送信を停止する（既定は注意を表示して次の寄り付きに回す）
 
         ウェイトファイルに載っている銘柄だけを管理対象とし、それ以外の保有銘柄には触れない。
         """
@@ -153,6 +160,7 @@ class AlpacaExecutionEngine:
         missing = [s for s in symbols if s not in latest]
         if missing:
             raise ExecutionError(f"最新価格を取得できない銘柄があります: {missing}")
+        stale = self._stale_prices(latest, symbols, now)
 
         planned: list[dict] = []
         for sym in symbols:
@@ -184,6 +192,11 @@ class AlpacaExecutionEngine:
         turnover_ratio = total_traded / equity
 
         reasons: list[str] = []
+        if stale:
+            reasons.append(
+                f"[Stale Price] 最新約定が {STALE_PRICE_DAYS} 日以上前の銘柄があります ({', '.join(stale)})。"
+                "価格データの配信状況を確認してください"
+            )
         # ガード2: 1注文あたりの最大想定元本チェック
         for o in planned:
             if o["notional"] > max_notional:
@@ -196,6 +209,7 @@ class AlpacaExecutionEngine:
         # ガード4: 最大注文数のチェック
         if len(planned) > max_orders:
             reasons.append(f"[Guard 4] 注文数 {len(planned)} が上限 {max_orders} を超えています")
+        clock = self.trading_client.get_clock()
         # ガード6: 冪等ロック（送信時のみ判定）
         open_orders = self.trading_client.get_orders(
             filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=symbols, limit=500)
@@ -211,8 +225,12 @@ class AlpacaExecutionEngine:
                 reasons.append(
                     f"[Guard 6] 未約定の注文が残っています ({pending})。約定かキャンセルを確認してから再実行してください"
                 )
+            if require_market_open and not clock.is_open:
+                reasons.append(
+                    f"[Market Hours] 市場がクローズ中のため送信を停止しました（--require-market-open）。"
+                    f"次の寄り付きは {clock.next_open} です"
+                )
 
-        clock = self.trading_client.get_clock()
         print(f"\n[Rebalance Plan | Mode: {'SUBMIT (PAPER)' if submit else 'DRY-RUN'} | Equity: ${equity:,.2f}]")
         if not clock.is_open:
             print(f"  ※ 市場はクローズ中です。成行注文は次の寄り付き ({clock.next_open}) で執行されます。")
@@ -247,6 +265,8 @@ class AlpacaExecutionEngine:
             self._append_log({**record, "blocked": False})
             if open_orders:
                 print("※ 未約定の注文が残っているため、このまま --submit するとガード6で停止します。")
+            if require_market_open and not clock.is_open:
+                print("※ --require-market-open が指定されているため、市場が開くまで --submit は停止します。")
             print("\n※ ドライラン完了。実際に発注するには --submit を付与してください。")
             return planned
 
@@ -284,6 +304,22 @@ class AlpacaExecutionEngine:
 
         print(f"\n発注完了: {len(submitted)} 件の注文を送信し、{self.trade_log_file} に記録しました。")
         return submitted
+
+    @staticmethod
+    def _stale_prices(latest: dict, symbols: list[str], now: datetime) -> list[str]:
+        """最新約定の時刻が STALE_PRICE_DAYS 日以上前（または不明）の銘柄を返す。"""
+        stale = []
+        for sym in symbols:
+            ts = getattr(latest[sym], "timestamp", None)
+            if ts is None:
+                stale.append(f"{sym}: 時刻不明")
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age = now - ts
+            if age >= timedelta(days=STALE_PRICE_DAYS):
+                stale.append(f"{sym}: {ts.astimezone(timezone.utc):%Y-%m-%d %H:%M} UTC, {age.total_seconds() / 86400:.1f}日前")
+        return stale
 
     def _last_submit_date(self) -> str | None:
         if not self.last_run_file.exists():
