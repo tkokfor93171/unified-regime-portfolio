@@ -1,4 +1,3 @@
-# src/allocators/core_overlay.py
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
