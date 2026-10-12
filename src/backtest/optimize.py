@@ -102,17 +102,20 @@ def random_search_core_overlay(
     test_frac: float = 0.20,
     seed: int = 42,
     progress_every_sec: float = 2.0,
+    eval_start: pd.Timestamp | None = None,
 ) -> SearchResult:
     """
-    先頭 (1 - test_frac) を選択期間として候補を評価し、末尾 test_frac は評価に使わない。
+    評価期間（eval_start 以降。未指定なら全期間）の先頭 (1 - test_frac) を選択期間として候補を評価し、
+    末尾 test_frac は評価に使わない。eval_start より前のデータはシグナルのウォームアップにだけ使う。
     シグナルはすべて因果的(ローリング・拡張窓・前日ウェイト)なので、全期間で一度だけ計算し
     選択期間の行だけを採点しても末尾期間の情報は混入しない。
     """
     crowd_score = compute_daily_crowding_score(prices, dollar_vol, CoreOverlayAllocator().tickers)
     thresholds = {q: crowd_score.expanding(min_periods=252).quantile(q) for q in SEARCH_SPACE["crowd_q"]}
 
-    split_date = prices.index[int(len(prices) * (1.0 - test_frac))]
-    in_train = prices.index < split_date
+    eval_prices = prices if eval_start is None else prices.loc[eval_start:]
+    split_date = eval_prices.index[int(len(eval_prices) * (1.0 - test_frac))]
+    in_train = eval_prices.index < split_date
 
     rng = np.random.default_rng(seed)
     n_total = min(n_candidates, math.prod(len(v) for v in SEARCH_SPACE.values()))
@@ -122,7 +125,7 @@ def random_search_core_overlay(
     no_improve = 0
     t0 = last = time.time()
 
-    print(f"\n=== RANDOM SEARCH (train: {prices.index[0].date()} -> {prices.index[in_train][-1].date()}) ===")
+    print(f"\n=== RANDOM SEARCH (train: {eval_prices.index[0].date()} -> {eval_prices.index[in_train][-1].date()}) ===")
     while len(seen) < n_total:
         draw = {k: rng.choice(v).item() for k, v in SEARCH_SPACE.items()}
         key = tuple(draw.values())
@@ -132,7 +135,7 @@ def random_search_core_overlay(
 
         params = CoreOverlayParams(**FIXED_PARAMS, **draw)
         weights = CoreOverlayAllocator(params).weights_from_crowding(prices, crowd_score, thresholds[params.crowd_q])
-        bt = run_backtest(prices, weights, cost_bps=cost_bps).loc[in_train]
+        bt = run_backtest(eval_prices, weights.loc[eval_prices.index[0]:], cost_bps=cost_bps).loc[in_train]
         score = selection_score(bt["port_ret"], bt["spy_ret"], bt["turnover"])
 
         if score > best_score:
@@ -153,5 +156,5 @@ def random_search_core_overlay(
     print(f"[DONE] {len(seen)} 候補を評価 ({time.time() - t0:.1f}s)  best_score={best_score:.4f}")
 
     best_weights = CoreOverlayAllocator(best).weights_from_crowding(prices, crowd_score, thresholds[best.crowd_q])
-    holdout = split_metrics(run_backtest(prices, best_weights, cost_bps=cost_bps), split_date)
+    holdout = split_metrics(run_backtest(eval_prices, best_weights.loc[eval_prices.index[0]:], cost_bps=cost_bps), split_date)
     return SearchResult(params=best, score=best_score, n_evaluated=len(seen), split_date=split_date, holdout=holdout)

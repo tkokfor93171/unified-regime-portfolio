@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = ROOT / "outputs"
 LOG_DIR = ROOT / "logs"
 DEFAULT_WEIGHTS_FILE = OUTPUT_DIR / "target_weights.json"
+# defensive_multi の12ヶ月リターンと36ヶ月Zスコア（計48ヶ月 ≒ 1,461暦日）が評価開始日までにそろう長さ
+WARMUP_CALENDAR_DAYS = 1500
 
 
 def run_label(args: argparse.Namespace) -> str:
@@ -47,9 +49,33 @@ def export_target_weights(strategy: str, weights: pd.DataFrame, params: dict, pa
     return payload
 
 
+def warn_short_history(prices: pd.DataFrame, load_start: pd.Timestamp, first_day: pd.Timestamp) -> None:
+    """ウォームアップ用のデータが足りない場合や、評価期間の途中から価格がある銘柄がある場合に注意を表示する。"""
+    if prices.index[0] > load_start + pd.Timedelta(days=7):
+        print(
+            f"  ※ データは {prices.index[0].date()} からしかなく、ウォームアップが {WARMUP_CALENDAR_DAYS} 暦日に足りません。"
+            "評価期間の初めはシグナルが未成熟です。"
+        )
+    late = {sym: d for sym, d in prices.apply(pd.Series.first_valid_index).items() if d > first_day}
+    if late:
+        listed = ", ".join(f"{sym} ({d.date()}~)" for sym, d in late.items())
+        print(f"  ※ 評価開始日より後に価格が始まる銘柄があります: {listed}。それまでのリターンは0として扱います。")
+
+
 def cmd_backtest(args: argparse.Namespace) -> None:
-    prices, dollar_vol = load_market_data(start_date=args.start, end_date=args.end)
+    # --start より前のデータはシグナルのウォームアップにだけ使い、損益と成績は --start 以降で計上する
+    eval_start = pd.Timestamp(args.start)
+    load_start = eval_start - pd.Timedelta(days=WARMUP_CALENDAR_DAYS)
+    prices, dollar_vol = load_market_data(start_date=load_start.strftime("%Y-%m-%d"), end_date=args.end)
+    window = prices.index[prices.index >= eval_start]
+    if window.empty:
+        sys.exit(f"[STOPPED] --start {args.start} 以降の価格データがありません。")
     print(f"Loaded {list(prices.columns)}: {prices.index[0].date()} -> {prices.index[-1].date()} ({len(prices)} days)")
+    print(
+        f"Backtest window: {window[0].date()} -> {window[-1].date()} ({len(window)} days), "
+        f"signals warmed up over the preceding {len(prices) - len(window)} days"
+    )
+    warn_short_history(prices, load_start, window[0])
 
     holdout = None
     params_note = ""
@@ -64,6 +90,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
                 patience=args.patience,
                 test_frac=args.test_frac,
                 seed=args.seed,
+                eval_start=window[0],
             )
             holdout = result.holdout
             print("\n=== Best Params (selected on TRAIN only) ===")
@@ -101,6 +128,10 @@ def cmd_backtest(args: argparse.Namespace) -> None:
 
     weights, crowd_series = allocator.generate_daily_weights(prices, dollar_vol)
     alpha_t = allocator.alpha_series_ if isinstance(allocator, EnsembleAllocator) else None
+
+    prices, weights, crowd_series = prices.loc[window[0]:], weights.loc[window[0]:], crowd_series.loc[window[0]:]
+    if alpha_t is not None:
+        alpha_t = alpha_t.loc[window[0]:]
     bt = run_backtest(prices, weights, cost_bps=args.cost_bps)
 
     overall = compute_metrics(bt["port_ret"], bt["spy_ret"], bt["turnover"])
@@ -214,7 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ensemble inv_vol only: lookback days for each strategy's volatility (Default: 63)",
     )
-    p_bt.add_argument("--start", default="2010-01-01")
+    p_bt.add_argument(
+        "--start",
+        default="2010-01-01",
+        help=f"Backtest start date. Data from {WARMUP_CALENDAR_DAYS} calendar days earlier is used only to warm up signals",
+    )
     p_bt.add_argument("--end", default=None, help="End date (exclusive). Default: latest available")
     p_bt.add_argument("--cost-bps", type=float, default=10.0)
     p_bt.add_argument("--optimize", action="store_true", help="core_overlay only: capped random search on TRAIN, report TEST")
@@ -288,6 +323,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "backtest":
+        try:
+            pd.Timestamp(args.start)
+        except ValueError:
+            parser.error(f"--start を日付として解釈できません: {args.start}")
         if args.optimize and args.strategy != "core_overlay":
             parser.error("--optimize は --strategy core_overlay のときだけ使えます")
         if args.force_optimized and not args.optimize:

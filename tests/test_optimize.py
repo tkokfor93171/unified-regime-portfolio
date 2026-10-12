@@ -26,21 +26,28 @@ def test_turnover_penalty_is_annualized():
     assert selection_score(port, spy, quiet) - selection_score(port, spy, busy) == pytest.approx(0.20 * 0.02 * 252)
 
 
-@pytest.fixture(scope="module")
-def search(market):
+@pytest.fixture(scope="module", params=[None, "2010-01-01"], ids=["whole_data", "after_warmup"])
+def search(request, market):
     prices, dollar_vol = market
-    return random_search_core_overlay(prices, dollar_vol, n_candidates=6, patience=6, seed=0)
+    eval_start = None if request.param is None else pd.Timestamp(request.param)
+    return eval_start, random_search_core_overlay(
+        prices, dollar_vol, n_candidates=6, patience=6, seed=0, eval_start=eval_start
+    )
 
 
 def test_holdout_is_test_period_of_selected_params(market, search):
+    eval_start, result = search
     prices, dollar_vol = market
-    weights, _ = CoreOverlayAllocator(search.params).generate_daily_weights(prices, dollar_vol)
-    expected = split_metrics(run_backtest(prices, weights), search.split_date)
+    weights, _ = CoreOverlayAllocator(result.params).generate_daily_weights(prices, dollar_vol)
+    window = prices if eval_start is None else prices.loc[eval_start:]
+    expected = split_metrics(run_backtest(window, weights.loc[window.index[0]:]), result.split_date)
 
-    pd.testing.assert_frame_equal(search.holdout, expected)
-    assert search.holdout.loc["TEST_Optimized", "Days"] == (prices.index >= search.split_date).sum()
-    assert search.holdout_alpha == expected.loc["TEST_Optimized", "Alpha(%)"]
-    assert search.accepted == (search.holdout_alpha > 0)
+    pd.testing.assert_frame_equal(result.holdout, expected)
+    # 学習期間と検証期間はウォームアップ後の評価期間を 80:20 に分ける
+    assert result.split_date == window.index[int(len(window) * 0.8)]
+    assert result.holdout.loc[["TRAIN_Optimized", "TEST_Optimized"], "Days"].sum() == len(window)
+    assert result.holdout_alpha == expected.loc["TEST_Optimized", "Alpha(%)"]
+    assert result.accepted == (result.holdout_alpha > 0)
 
 
 def test_missing_holdout_is_not_accepted():
