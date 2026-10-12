@@ -124,64 +124,6 @@ SPY 100%を常時コアとして保有し、市場環境が良好な条件がそ
 
 ※ 既定の上限値は、運用開始後の少額なリバランス調整を想定した設定になっている。空の口座から初めてポジションを建てるときはガード2と3に引っかかって停止するため、まずはドライランで計画を確認したうえで、`--max-notional` と `--max-turnover` を引き上げて実行する必要がある。また、`core_overlay` の既定ウェイトはグロス最大130%となるため、信用取引の買付余力も使用する。
 
----
-
-## セットアップ
-
-Python 3.10 以上を必要とする（Python 3.13 / pandas 3.0 および 2.3 / alpaca-py 0.44 にて動作確認済み）。
-
-```bash
-python -m venv .venv
-source .venv/bin/activate        # Windowsの場合: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env             # AlpacaのAPIキー（APCA_API_KEY_ID / APCA_API_SECRET_KEY）を記入
-```
-
----
-
-## 実行方法
-
-```bash
-# Step 1: バックテストの実行（成績の表示と同時に outputs/target_weights.json を自動生成する）
-python main.py backtest --strategy core_overlay --start 2010-01-01 --cost-bps 10.0
-python main.py backtest --strategy defensive_multi --start 2005-01-01 --cost-bps 10.0
-
-# core_overlay のパラメータをランダムサーチで最適化する場合
-python main.py backtest --strategy core_overlay --optimize
-
-# Step 2: 発注計画をドライランで確認する（実際の注文は送信されない）
-python main.py rebalance
-
-# 初回構築時など、評価額の10%を超えるリバランスを許可してドライラン・発注する場合
-python main.py rebalance --max-notional 100000 --max-turnover 1.0
-
-# Step 3: 計画とガードを確認したうえで発注を実行し、口座状態を監査する
-python main.py rebalance --submit
-python main.py audit
-python main.py audit --order-id <注文ID>
-```
-
-* `outputs/target_weights.json` は、最後に実行した `backtest` の戦略結果で上書きされる。Step 1 の2つのコマンドを続けて実行した場合は、後に実行した `defensive_multi` のウェイトが発注対象になる。
-* `rebalance` サブコマンドは `execute` という別名でも実行できる。
-* `backtest` には `--end`（終了日。その日は含まない）も指定できる。2026-07-31までで止めるには `--end 2026-08-01` を指定する。ランダムサーチの挙動は `--n-candidates`、`--patience`、`--test-frac`、`--seed` で調整できる。
-* `yfinance` は米国市場の取引時間中に実行すると当日の途中価格を返すため、発注用の目標ウェイトを生成する際は米国市場の引け後に実行する。
-
-### 出力ファイル一覧
-
-`outputs/` と `logs/` ディレクトリは実行時に自動生成され、Gitの管理対象からは除外している。
-
-| パス | 内容 |
-| --- | --- |
-| `outputs/target_weights.json` | 最新日の目標ウェイト（戦略名・基準日・使用パラメータを含む） |
-| `outputs/<strategy>_daily.csv` | 日次リターン、ターンオーバー、コスト、資産推移、レジーム指標 |
-| `outputs/<strategy>_weights.csv` | 日次の目標ウェイト推移 |
-| `outputs/<strategy>_metrics.csv` | 成績サマリー（全期間、`--optimize` 時は学習期間・検証期間、レジーム別） |
-| `outputs/<strategy>_performance.png` | 累積リターン（対数軸）とドローダウンの比較チャート |
-| `outputs/<strategy>_regime.png` | 混雑度レジーム別のパフォーマンス比較チャート |
-| `logs/trade_log.jsonl` | 執行エンジンの全実行ログ（JSON Lines形式） |
-| `logs/last_run.json` | 1日1回制限用の冪等ロックファイル |
-
----
 
 ## 参考成績とパフォーマンス推移
 
@@ -198,7 +140,7 @@ python main.py audit --order-id <注文ID>
 ![defensive_multi の累積リターンとドローダウン（2005-01-03〜2026-07-31）](docs/defensive_multi_performance.png)
 
 * **`core_overlay` の特徴**：SPYを上回る累積リターンを記録しているが、その超過分は主にベータ（1.09）のレバレッジ効果によるもので、既定パラメータにおけるCAPMアルファはほぼゼロ（-0.14%）となっている。コロナショック（2020年）や2022年の下落局面でもSPYに近いドローダウンを受けている。
-* **`defensive_multi` の特徴**：実現ボラティリティを年率換算（$\times \sqrt{12}$）してから目標ボラティリティ10%と比較しているため、ボラティリティ倍率の中央値は約0.7、BILの保有比率の中央値は40%になっている。上昇相場での追随率は抑えられるが、2008年のリーマンショック、2020年のコロナショック、2022年の株債同時安のいずれにおいてもドローダウンを抑え、シャープレシオ 0.93 とアルファ +5.40% を出している。リスク水準を引き上げたい場合は `DefensiveMultiAllocator(target_vol=...)` の値を調整する。
+* **`defensive_multi` の特徴**：実現ボラティリティを年率換算してから目標ボラティリティ10%と比較しているため、ボラティリティ倍率の中央値は約0.7、BILの保有比率の中央値は40%になっている。上昇相場での追随率は抑えられるが、2008年のリーマンショック、2020年のコロナショック、2022年の株債同時安のいずれにおいてもドローダウンを抑え、シャープレシオ 0.93 とアルファ +5.40% を出している。リスク水準を引き上げたい場合は `DefensiveMultiAllocator(target_vol=...)` の値を調整する。
 
 ---
 
