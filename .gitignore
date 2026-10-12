@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets (.env.example is tracked)
+.env
+
+# Runtime artifacts
+# Root-anchored on purpose: an unanchored "data/" also matches src/data/
+/outputs/
+/logs/
+/results/
+/data/
+/cache/
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
